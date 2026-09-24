@@ -38,7 +38,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import com.github.jing332.tts_server_android.compose.MainActivity
 
 /** 悬浮歌词条的设置页。入口：长按歌词条，或 `am start` 直接拉起。 */
 class LyricSettingsActivity : ComponentActivity() {
@@ -163,7 +162,10 @@ private fun LyricSettingsScreen() {
             LyricOverlay.refresh()
         }
 
-        SectionTitle(if (bgAlpha == 0) "背景　纯透明" else "背景　不透明度 " + (bgAlpha * 100 / 255) + "%")
+        SectionTitle(
+            if (bgAlpha == 0) "背景　纯透明"
+            else "背景　不透明度 " + (bgAlpha * 100 / 255) + "%"
+        )
         Slider(
             value = bgAlpha.toFloat(),
             onValueChange = {

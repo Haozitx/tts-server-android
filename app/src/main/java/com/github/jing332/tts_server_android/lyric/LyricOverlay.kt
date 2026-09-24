@@ -13,7 +13,6 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
-import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -167,7 +166,7 @@ object LyricOverlay {
         if (!canDrawOverlay(ctx)) return
 
         val scale = LyricPrefs.fontScale(ctx)
-        val typeface = typefaceOf(LyricPrefs.fontFamily(ctx))
+        val tf = typefaceOf(LyricPrefs.fontFamily(ctx))
         val colorMode = LyricPrefs.colorMode(ctx)
         val textColor = resolveTextColor(ctx, colorMode)
         val shadowColor = if (textColor == Color.BLACK) Color.WHITE else Color.BLACK
@@ -177,37 +176,39 @@ object LyricOverlay {
         val showNext = LyricPrefs.isShowNext(ctx)
 
         val view = ensureView(ctx)
-        val maxWidth = (ctx.resources.displayMetrics.widthPixels * MAX_WIDTH_RATIO).toInt()
+        val maxW = (ctx.resources.displayMetrics.widthPixels * MAX_WIDTH_RATIO).toInt()
+        val mainSp = BASE_SP * scale
+        val sideSp = mainSp * 0.7f
 
-        currentView?.apply {
-            text = state.text
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, BASE_SP * scale)
-            setTextColor(textColor)
-            typeface = typeface
-            setShadowLayer(6f, 0f, 0f, shadowColor)
-            maxWidth = maxWidth
+        currentView?.let { tv ->
+            tv.text = state.text
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, mainSp)
+            tv.setTextColor(textColor)
+            tv.typeface = tf
+            tv.setShadowLayer(6f, 0f, 0f, shadowColor)
+            tv.maxWidth = maxW
         }
 
-        val sideSp = BASE_SP * scale * 0.7f
-        prevView?.apply {
-            text = state.previous
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
-            setTextColor(textColor)
-            typeface = typeface
-            setShadowLayer(6f, 0f, 0f, shadowColor)
-            maxWidth = maxWidth
-            alpha = 0.6f
-            visibility = if (showPrev && state.previous.isNotBlank()) View.VISIBLE else View.GONE
+        prevView?.let { tv ->
+            tv.text = state.previous
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
+            tv.setTextColor(textColor)
+            tv.typeface = tf
+            tv.setShadowLayer(6f, 0f, 0f, shadowColor)
+            tv.maxWidth = maxW
+            tv.alpha = 0.6f
+            tv.visibility = if (showPrev && state.previous.isNotBlank()) View.VISIBLE else View.GONE
         }
-        nextView?.apply {
-            text = state.next
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
-            setTextColor(textColor)
-            typeface = typeface
-            setShadowLayer(6f, 0f, 0f, shadowColor)
-            maxWidth = maxWidth
-            alpha = 0.6f
-            visibility = if (showNext && state.next.isNotBlank()) View.VISIBLE else View.GONE
+
+        nextView?.let { tv ->
+            tv.text = state.next
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
+            tv.setTextColor(textColor)
+            tv.typeface = tf
+            tv.setShadowLayer(6f, 0f, 0f, shadowColor)
+            tv.maxWidth = maxW
+            tv.alpha = 0.6f
+            tv.visibility = if (showNext && state.next.isNotBlank()) View.VISIBLE else View.GONE
         }
 
         view.background = if (bgAlpha <= 0) null else GradientDrawable().apply {
@@ -293,8 +294,8 @@ object LyricOverlay {
         if (LyricPrefs.hasPosition(ctx)) return
         view.post {
             val p = layoutParams ?: return@post
-            val width = ctx.resources.displayMetrics.widthPixels
-            p.x = ((width - view.width) / 2).coerceAtLeast(0)
+            val screenWidth = ctx.resources.displayMetrics.widthPixels
+            p.x = ((screenWidth - view.width) / 2).coerceAtLeast(0)
             runCatching { wm.updateViewLayout(view, p) }
         }
     }
