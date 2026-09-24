@@ -1,4 +1,3 @@
-
 package com.github.jing332.tts_server_android.lyric
 
 import android.content.BroadcastReceiver
@@ -35,16 +34,26 @@ import kotlin.math.abs
  * 悬浮歌词条：把正在朗读的那一句浮在屏幕上层，像桌面歌词一样逐句走。
  *
  * 用系统窗口（WindowManager + TYPE_APPLICATION_OVERLAY）实现，不额外依赖第三方悬浮窗库、
- * 不额外起常驻服务：App 进程活着的时候随朗读数据出现，停止朗读约 8 秒后自动移除。
+ * 不额外起常驻服务：App 进程活着的时候随朗读数据出现，停读后自动移除。
+ *
+ * 三个约定：
+ *  1. 切换由总线推送驱动——合成器在音频开始输出时才上报，所以歌词不会比声音超前。
+ *  2. 每一句按它会念多久来定最少停留时间，读完之前不会消失。
+ *  3. 只能上下拖；左右固定为「居左 / 居中 / 居右」三档。
  */
 object LyricOverlay {
+    /** 时长未知时的兜底停留时间。 */
     private const val HIDE_DELAY_MS = 8_000L
+
+    /** 按估算时长停留之外，再宽限一会儿。 */
+    private const val HIDE_EXTRA_MS = 1_500L
+
     private const val LONG_PRESS_MS = 500L
     private const val TOUCH_SLOP = 12f
     private const val BASE_SP = 18f
 
-    /** 长句折行：文字最多占屏宽的九成，超了自动换行。 */
-    private const val MAX_WIDTH_RATIO = 0.9f
+    /** 文字最多占屏宽的比例（剩下的是边距，和横向对齐一起决定行数）。 */
+    private const val MAX_WIDTH_RATIO = 0.94f
     private const val MAX_LINES = 4
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -61,9 +70,7 @@ object LyricOverlay {
 
     private var lastState = LyricBus.LyricState()
 
-    private var downRawX = 0f
     private var downRawY = 0f
-    private var downX = 0
     private var downY = 0
     private var downTime = 0L
     private var dragging = false
@@ -104,7 +111,8 @@ object LyricOverlay {
             segments = listOf(text),
             index = 0,
             text = text,
-            updatedAt = System.currentTimeMillis()
+            updatedAt = System.currentTimeMillis(),
+            durationMs = LyricBus.estimateDurationMs(text),
         )
         render(lastState)
     }
@@ -187,6 +195,7 @@ object LyricOverlay {
             tv.typeface = tf
             tv.setShadowLayer(6f, 0f, 0f, shadowColor)
             tv.maxWidth = maxW
+            tv.visibility = View.VISIBLE
         }
 
         prevView?.let { tv ->
@@ -218,8 +227,14 @@ object LyricOverlay {
 
         layoutParams?.flags = windowFlags(ctx)
 
-        if (!view.isAttachedToWindow) attach(view) else updateLayout()
-        scheduleHide(locked)
+        if (!view.isAttachedToWindow) {
+            attach(view)
+        } else {
+            updateLayout()
+            // 文字换了，宽高跟着变，重新按对齐算一次横坐标
+            view.post { applyAlign() }
+        }
+        scheduleHide(state.durationMs, locked)
     }
 
     private fun ensureView(ctx: Context): LinearLayout {
@@ -266,13 +281,10 @@ object LyricOverlay {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            if (LyricPrefs.hasPosition(ctx)) {
-                x = LyricPrefs.posX(ctx)
-                y = LyricPrefs.posY(ctx)
-            } else {
-                x = 0
-                y = (ctx.resources.displayMetrics.heightPixels * 0.72f).toInt()
-            }
+            // 横坐标交给 applyAlign 算，这里只给一个初值
+            x = 0
+            y = if (LyricPrefs.hasPosY(ctx)) LyricPrefs.posY(ctx)
+            else (ctx.resources.displayMetrics.heightPixels * 0.72f).toInt()
         }
 
         windowManager = ctx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
@@ -286,18 +298,11 @@ object LyricOverlay {
     }
 
     private fun attach(view: LinearLayout) {
-        val ctx = appContext ?: return
         val wm = windowManager ?: return
         val params = layoutParams ?: return
         runCatching { wm.addView(view, params) }.onFailure { return }
-
-        if (LyricPrefs.hasPosition(ctx)) return
-        view.post {
-            val p = layoutParams ?: return@post
-            val screenWidth = ctx.resources.displayMetrics.widthPixels
-            p.x = ((screenWidth - view.width) / 2).coerceAtLeast(0)
-            runCatching { wm.updateViewLayout(view, p) }
-        }
+        // 宽高要等布局完成才知道，所以下一帧再对齐
+        view.post { applyAlign() }
     }
 
     private fun updateLayout() {
@@ -306,11 +311,30 @@ object LyricOverlay {
         runCatching { windowManager?.updateViewLayout(view, params) }
     }
 
-    private fun scheduleHide(locked: Boolean) {
+    /** 按「居左／居中／居右」档位算横坐标；纵坐标不动。 */
+    private fun applyAlign() {
+        val ctx = appContext ?: return
+        val view = rootView ?: return
+        val params = layoutParams ?: return
+        if (view.width <= 0) return
+        val screenWidth = ctx.resources.displayMetrics.widthPixels
+        params.x = when (LyricPrefs.align(ctx)) {
+            LyricPrefs.ALIGN_LEFT -> 0
+            LyricPrefs.ALIGN_RIGHT -> (screenWidth - view.width).coerceAtLeast(0)
+            else -> ((screenWidth - view.width) / 2).coerceAtLeast(0)
+        }
+        runCatching { windowManager?.updateViewLayout(view, params) }
+    }
+
+    private fun scheduleHide(durationMs: Long, locked: Boolean) {
         hideJob?.cancel()
+        hideJob = null
+        // 钉住的时候不自动隐藏，想看多久就看多久
+        if (locked) return
+        val hold = if (durationMs > 0L) durationMs + HIDE_EXTRA_MS else HIDE_DELAY_MS
         hideJob = scope.launch {
-            delay(HIDE_DELAY_MS)
-            if (locked || !isLockedNow()) hide()
+            delay(hold)
+            if (!isLockedNow()) hide()
         }
     }
 
@@ -334,9 +358,7 @@ object LyricOverlay {
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                downRawX = event.rawX
                 downRawY = event.rawY
-                downX = layoutParams?.x ?: 0
                 downY = layoutParams?.y ?: 0
                 downTime = SystemClock.uptimeMillis()
                 dragging = false
@@ -344,13 +366,12 @@ object LyricOverlay {
             }
 
             MotionEvent.ACTION_MOVE -> {
-                val dx = event.rawX - downRawX
                 val dy = event.rawY - downRawY
-                if (abs(dx) > TOUCH_SLOP || abs(dy) > TOUCH_SLOP) dragging = true
+                if (abs(dy) > TOUCH_SLOP) dragging = true
                 val params = layoutParams
                 if (dragging && params != null) {
-                    params.x = downX + dx.toInt()
-                    params.y = downY + dy.toInt()
+                    // 只跟纵向：横向锁在档位上
+                    params.y = (downY + dy).toInt()
                     runCatching { windowManager?.updateViewLayout(view, params) }
                 }
                 true
@@ -359,7 +380,7 @@ object LyricOverlay {
             MotionEvent.ACTION_UP -> {
                 if (dragging) {
                     val params = layoutParams
-                    if (params != null && ctx != null) LyricPrefs.setPosition(ctx, params.x, params.y)
+                    if (params != null && ctx != null) LyricPrefs.setPosY(ctx, params.y)
                 } else if (SystemClock.uptimeMillis() - downTime >= LONG_PRESS_MS) {
                     openSettings(view.context)
                 }
