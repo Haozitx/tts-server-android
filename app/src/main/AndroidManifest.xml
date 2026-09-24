@@ -17,6 +17,8 @@
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 悬浮歌词条需要（「显示在其他应用上层」） -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -187,6 +189,18 @@
             android:exported="true"
             android:label="@string/debug"
             android:taskAffinity="debug.tts" />
+
+        <!-- 悬浮歌词：设置页（长按歌词条进入；也可用 am start 直接拉起） -->
+        <activity
+            android:name=".lyric.LyricSettingsActivity"
+            android:exported="true"
+            android:label="悬浮歌词设置" />
+
+        <!-- 悬浮歌词：空 Provider，仅用于进程启动时订阅朗读文本 -->
+        <provider
+            android:name=".lyric.LyricInitProvider"
+            android:authorities="${applicationId}.lyric-init"
+            android:exported="false" />
 
         <service
             android:name="androidx.appcompat.app.AppLocalesMetadataHolderService"

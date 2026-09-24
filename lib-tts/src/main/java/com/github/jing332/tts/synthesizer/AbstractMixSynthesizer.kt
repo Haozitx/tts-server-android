@@ -8,6 +8,7 @@ import com.github.jing332.tts.SynthesizerContext
 import com.github.jing332.tts.error.RequesterError
 import com.github.jing332.tts.error.SynthesisError
 import com.github.jing332.tts.error.TextProcessorError
+import com.github.jing332.tts.lyric.LyricBus
 import com.github.jing332.tts.speech.EmptyInputStream
 import com.github.jing332.tts.synthesizer.event.ErrorEvent
 import com.github.jing332.tts.synthesizer.event.Event
@@ -196,7 +197,11 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
             produce<ChannelPayload>(CoroutineName("Synthesis producer"), PROCUDE_CAPACITY) {
                 textProcess(params, presetConfigId)
                     .onSuccess { list ->
-                        for (segment in list) {
+                        // 悬浮歌词：先把整段切分结果推给窗口做「上一句／下一句」
+                        LyricBus.onSegments(list.map { it.text })
+                        for ((index, segment) in list.withIndex()) {
+                            // 悬浮歌词：开始合成这一句的时候更新当前行
+                            LyricBus.onSegment(index, segment.text)
                             requestAndProcess(
                                 channel,
                                 params.copy(text = segment.text),
