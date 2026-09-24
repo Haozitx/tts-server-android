@@ -46,9 +46,9 @@ object LyricBus {
         if (text.isBlank()) return 0L
         val chars = text.count { !it.isWhitespace() }
         val puncts = text.count { it in "。？！?!；;：:，,、…—" }
-        val raw = chars * MS_PER_CHAR + puncts * MS_PER_PUNCT
+        val rawMs = chars.toLong() * MS_PER_CHAR + puncts.toLong() * MS_PER_PUNCT
         val s = if (speed <= 0.01f) 1f else speed
-        return (raw / s).coerceIn(MIN_DURATION_MS, MAX_DURATION_MS)
+        return (rawMs / s).toLong().coerceIn(MIN_DURATION_MS, MAX_DURATION_MS)
     }
 
     /** 一段文本被切分成多个朗读片段。 */
