@@ -1,4 +1,3 @@
-
 package com.github.jing332.tts_server_android.lyric
 
 import android.content.Context
@@ -17,6 +16,8 @@ object LyricPrefs {
     private const val KEY_LOCKED = "locked"
     private const val KEY_POS_X = "pos_x"
     private const val KEY_POS_Y = "pos_y"
+    private const val KEY_ALIGN = "align"
+    private const val KEY_THEME = "theme"
 
     const val COLOR_FOLLOW_SYSTEM = 0
     const val COLOR_WHITE = 1
@@ -26,6 +27,16 @@ object LyricPrefs {
     const val FONT_SANS = 1
     const val FONT_SERIF = 2
     const val FONT_MONO = 3
+
+    /** 横向对齐：只在这三档里选，不给自由拖横坐标。 */
+    const val ALIGN_LEFT = 0
+    const val ALIGN_CENTER = 1
+    const val ALIGN_RIGHT = 2
+
+    /** 设置页自身的主题。 */
+    const val THEME_FOLLOW_SYSTEM = 0
+    const val THEME_DARK = 1
+    const val THEME_LIGHT = 2
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -69,18 +80,40 @@ object LyricPrefs {
     fun setBgAlpha(ctx: Context, value: Int) =
         sp(ctx).edit().putInt(KEY_BG_ALPHA, value.coerceIn(0, 255)).apply()
 
-    /** 锁定后不可拖动、不可点击，触摸直接穿透到下层应用。 */
+    /** 锁定：不可拖动、不可长按，触摸穿透到下层，同时不再自动隐藏。 */
     fun isLocked(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_LOCKED, false)
 
     fun setLocked(ctx: Context, value: Boolean) =
         sp(ctx).edit().putBoolean(KEY_LOCKED, value).apply()
 
-    fun posX(ctx: Context): Int = sp(ctx).getInt(KEY_POS_X, Int.MIN_VALUE)
+    /** 横向对齐档位（左／中／右）。 */
+    fun align(ctx: Context): Int = sp(ctx).getInt(KEY_ALIGN, ALIGN_CENTER)
 
+    fun setAlign(ctx: Context, value: Int) =
+        sp(ctx).edit().putInt(KEY_ALIGN, value.coerceIn(ALIGN_LEFT, ALIGN_RIGHT)).apply()
+
+    /** 设置页主题档位（跟随系统／深色／浅色）。 */
+    fun theme(ctx: Context): Int = sp(ctx).getInt(KEY_THEME, THEME_FOLLOW_SYSTEM)
+
+    fun setTheme(ctx: Context, value: Int) =
+        sp(ctx).edit().putInt(KEY_THEME, value.coerceIn(THEME_FOLLOW_SYSTEM, THEME_LIGHT)).apply()
+
+    /** 只记纵向位置；横向由对齐档位算出来，不再存自由横坐标。 */
     fun posY(ctx: Context): Int = sp(ctx).getInt(KEY_POS_Y, Int.MIN_VALUE)
 
-    fun hasPosition(ctx: Context): Boolean = posX(ctx) != Int.MIN_VALUE && posY(ctx) != Int.MIN_VALUE
+    fun hasPosY(ctx: Context): Boolean = posY(ctx) != Int.MIN_VALUE
 
+    fun setPosY(ctx: Context, y: Int) = sp(ctx).edit().putInt(KEY_POS_Y, y).apply()
+
+    // --- 旧的自由坐标接口，保留读取能力，新代码不再写 ---
+    @Deprecated("横向改为对齐档位，纵向用 posY")
+    fun posX(ctx: Context): Int = sp(ctx).getInt(KEY_POS_X, Int.MIN_VALUE)
+
+    @Deprecated("横向改为对齐档位，纵向用 hasPosY")
+    fun hasPosition(ctx: Context): Boolean =
+        posX(ctx) != Int.MIN_VALUE && posY(ctx) != Int.MIN_VALUE
+
+    @Deprecated("横向改为对齐档位，纵向用 setPosY")
     fun setPosition(ctx: Context, x: Int, y: Int) {
         sp(ctx).edit().putInt(KEY_POS_X, x).putInt(KEY_POS_Y, y).apply()
     }
