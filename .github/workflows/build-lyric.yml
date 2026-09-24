@@ -43,18 +43,21 @@ jobs:
           } > local.properties
           cat local.properties
 
-      - name: Build lyric flavor APK
+      # 注意：必须构建 release。debug 构建不做 R8，slf4j-api 2.x 接口与
+      # logback 旧实现类混在一起会抛 AbstractMethodError: Logger.atLevel，
+      # 一朗读就闪退（与悬浮歌词代码无关，上游 debug 构建同样会崩）。
+      - name: Build lyric flavor APK (release)
         run: |
           chmod +x gradlew
           set -o pipefail
-          ./gradlew assembleLyricDebug --build-cache --parallel --stacktrace 2>&1 | tee build.log
+          ./gradlew assembleLyricRelease --build-cache --parallel --stacktrace 2>&1 | tee build.log
 
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: tts-server-lyric-debug-apk
-          path: app/build/outputs/apk/lyric/debug/*.apk
+          name: tts-server-lyric-release-apk
+          path: app/build/outputs/apk/lyric/release/*.apk
           if-no-files-found: error
 
       - name: Report failure to issue
