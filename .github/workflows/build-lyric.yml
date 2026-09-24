@@ -62,6 +62,19 @@ jobs:
           path: app/build/outputs/apk/lyric/release/*.apk
           if-no-files-found: error
 
+      # 推到 Release，给一个不需登录的直链（手机侧才能自动下载安装）
+      - name: Publish APK to Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp app/build/outputs/apk/lyric/release/*.apk lyric-overlay.apk
+          ls -l lyric-overlay.apk
+          gh release view lyric-build >/dev/null 2>&1 \
+            || gh release create lyric-build --title "歌词版（自动构建）" \
+                 --notes "自动构建产物，每次 push 覆盖更新。" --prerelease
+          gh release upload lyric-build lyric-overlay.apk --clobber
+
       # 失败时把关键行推到 ci-logs 分支，方便直接读取（Actions 日志需要登录态）
       - name: Dump failure log to branch
         if: failure()
