@@ -1,4 +1,3 @@
-
 package com.github.jing332.tts_server_android.lyric
 
 import android.content.Intent
@@ -13,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -25,6 +25,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
@@ -39,30 +40,61 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
-/** 悬浮歌词条的设置页。入口：长按歌词条，或 `am start` 直接拉起。 */
+/**
+ * 悬浮歌词条的设置页。入口：长按歌词条，或 `am start` 直接拉起。
+ *
+ * 页面自己带底色（Surface = colorScheme.background），不再靠 Activity 主题的背景，
+ * 所以不会出现「黑底黑字」那种背景与文字分家的情形。
+ */
 class LyricSettingsActivity : ComponentActivity() {
+
+    /** 页面主题档，改了就整页重组。 */
+    private val themeMode = mutableStateOf(LyricPrefs.THEME_FOLLOW_SYSTEM)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         title = "悬浮歌词设置"
+        themeMode.value = LyricPrefs.theme(this)
+
         setContent {
+            val dark = when (themeMode.value) {
+                LyricPrefs.THEME_DARK -> true
+                LyricPrefs.THEME_LIGHT -> false
+                else -> isSystemInDarkTheme()
+            }
+
             MaterialTheme(
-                colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+                colorScheme = if (dark) darkColorScheme() else lightColorScheme()
             ) {
-                LyricSettingsScreen()
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    LyricSettingsScreen(
+                        themeMode = themeMode.value,
+                        onThemeChange = {
+                            themeMode.value = it
+                            LyricPrefs.setTheme(this, it)
+                        }
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
-private fun LyricSettingsScreen() {
+private fun LyricSettingsScreen(
+    themeMode: Int,
+    onThemeChange: (Int) -> Unit,
+) {
     val ctx = LocalContext.current
 
     var enabled by remember { mutableStateOf(LyricPrefs.isEnabled(ctx)) }
     var showPrev by remember { mutableStateOf(LyricPrefs.isShowPrev(ctx)) }
     var showNext by remember { mutableStateOf(LyricPrefs.isShowNext(ctx)) }
     var locked by remember { mutableStateOf(LyricPrefs.isLocked(ctx)) }
+    var align by remember { mutableStateOf(LyricPrefs.align(ctx)) }
     var fontScale by remember { mutableStateOf(LyricPrefs.fontScale(ctx)) }
     var fontFamily by remember { mutableStateOf(LyricPrefs.fontFamily(ctx)) }
     var colorMode by remember { mutableStateOf(LyricPrefs.colorMode(ctx)) }
@@ -101,10 +133,46 @@ private fun LyricSettingsScreen() {
             LyricPrefs.setShowNext(ctx, it)
             LyricOverlay.refresh()
         }
-        SwitchRow("锁定位置", "锁定后无法拖动和长按，触摸穿透到下层；要解锁回本页关掉", locked) {
+        SwitchRow(
+            "钉住（锁定位置）",
+            "锁上后不能拖动也不能长按，触摸穿透到下层；同时不再自动隐藏。要解锁回本页关掉",
+            locked
+        ) {
             locked = it
             LyricPrefs.setLocked(ctx, it)
             LyricOverlay.refresh()
+        }
+
+        Spacer(Modifier.height(8.dp))
+        HorizontalDivider()
+        SectionTitle("横向位置（只能上下拖，左右在这里选）")
+        RadioRow("居左", align == LyricPrefs.ALIGN_LEFT) {
+            align = LyricPrefs.ALIGN_LEFT
+            LyricPrefs.setAlign(ctx, align)
+            LyricOverlay.refresh()
+        }
+        RadioRow("居中", align == LyricPrefs.ALIGN_CENTER) {
+            align = LyricPrefs.ALIGN_CENTER
+            LyricPrefs.setAlign(ctx, align)
+            LyricOverlay.refresh()
+        }
+        RadioRow("居右", align == LyricPrefs.ALIGN_RIGHT) {
+            align = LyricPrefs.ALIGN_RIGHT
+            LyricPrefs.setAlign(ctx, align)
+            LyricOverlay.refresh()
+        }
+
+        Spacer(Modifier.height(8.dp))
+        HorizontalDivider()
+        SectionTitle("本页主题")
+        RadioRow("跟随系统", themeMode == LyricPrefs.THEME_FOLLOW_SYSTEM) {
+            onThemeChange(LyricPrefs.THEME_FOLLOW_SYSTEM)
+        }
+        RadioRow("深色", themeMode == LyricPrefs.THEME_DARK) {
+            onThemeChange(LyricPrefs.THEME_DARK)
+        }
+        RadioRow("浅色", themeMode == LyricPrefs.THEME_LIGHT) {
+            onThemeChange(LyricPrefs.THEME_LIGHT)
         }
 
         Spacer(Modifier.height(8.dp))
@@ -183,7 +251,8 @@ private fun LyricSettingsScreen() {
             when {
                 !granted -> "状态：还没给悬浮窗权限，歌词不会显示"
                 !enabled -> "状态：权限已给，但悬浮歌词关着"
-                else -> "状态：就绪。拖动可移动，长按进本页"
+                locked -> "状态：就绪（已钉住）。要拖动先解锁"
+                else -> "状态：就绪。上下拖动可移动，长按进本页"
             }
         )
 
