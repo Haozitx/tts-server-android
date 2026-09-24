@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -43,14 +43,16 @@ jobs:
           } > local.properties
           cat local.properties
 
-      # 注意：必须构建 release。debug 构建不做 R8，slf4j-api 2.x 接口与
-      # logback 旧实现类混在一起会抛 AbstractMethodError: Logger.atLevel，
-      # 一朗读就闪退（与悬浮歌词代码无关，上游 debug 构建同样会崩）。
+      # 必须 release：debug 不做 R8，slf4j-api 2.x 默认方法会抛
+      # AbstractMethodError: Logger.atLevel，一朗读就闪退（与歌词代码无关）。
+      # R8 吃内存，这里显式给 4G 堆，避开 OOM。
       - name: Build lyric flavor APK (release)
         run: |
           chmod +x gradlew
           set -o pipefail
-          ./gradlew assembleLyricRelease --build-cache --parallel --stacktrace 2>&1 | tee build.log
+          ./gradlew assembleLyricRelease \
+            --build-cache --parallel --stacktrace \
+            -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m" 2>&1 | tee build.log
 
       - name: Upload APK
         if: success()
@@ -60,23 +62,16 @@ jobs:
           path: app/build/outputs/apk/lyric/release/*.apk
           if-no-files-found: error
 
-      - name: Report failure to issue
+      # 失败时把关键行推到 ci-logs 分支，方便直接读取（Actions 日志需要登录态）
+      - name: Dump failure log to branch
         if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          grep -nE "^(e: |error:|FAILURE|What went wrong|Caused by:|Execution failed)" build.log > err.txt || true
-          if [ ! -s err.txt ]; then tail -n 150 build.log > err.txt; fi
-          {
-            echo "CI 编译失败，下面是自动摘出的关键行。"
-            echo ""
-            echo '```'
-            head -n 160 err.txt
-            echo '```'
-          } > body.md
-          NUM=$(gh issue list --state open --search "CI in:title" --json number -q '.[0].number' || true)
-          if [ -n "$NUM" ]; then
-            gh issue comment "$NUM" --body-file body.md
-          else
-            gh issue create --title "CI 编译错误（自动上报）" --body-file body.md
-          fi
+          grep -nE "^(e: |error:|FAILURE|What went wrong|Caused by:|Execution failed|> Task .*FAILED|A failure occurred)" build.log > ci-failure.log || true
+          if [ ! -s ci-failure.log ]; then tail -n 300 build.log > ci-failure.log; fi
+          echo "==== 日志行数：$(wc -l < build.log) ====" >> ci-failure.log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B ci-logs
+          git add -f ci-failure.log
+          git commit -m "ci: release 构建失败日志"
+          git push -f origin ci-logs
