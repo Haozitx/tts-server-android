@@ -109,6 +109,11 @@ android {
             dimension = "version"
             applicationIdSuffix ".dev"
         }
+        // 歌词版：自带悬浮歌词条，包名与官方版 / dev 版都错开，可共存
+        lyric {
+            dimension = "version"
+            applicationIdSuffix ".lyric"
+        }
     }
 
     android.applicationVariants.configureEach { variant ->
