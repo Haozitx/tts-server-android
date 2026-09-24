@@ -142,18 +142,32 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
         config: TtsConfiguration,
         retries: Int = 0,
         maxRetries: Int = context.cfg.maxRetryTimes(),
+        lyricIndex: Int = -1,
+        lyricText: String = "",
     ) {
         val request = RequestPayload(params, config)
+
+        // 悬浮歌词：这一句只在音频真的开始输出时报一次。
+        // 合成比播放快得多，按合成时机上报会让歌词比声音超前一整句。
+        var lyricSent = false
+        fun notifyLyric() {
+            if (lyricSent || lyricIndex < 0) return
+            lyricSent = true
+            LyricBus.onSegment(lyricIndex, lyricText)
+        }
+
         suspend fun retry() {
             return if (config.standbyConfig != null && context.cfg.toggleTry() > retries) {
                 event(NormalEvent.StandbyTts(request.copy(config = config.standbyConfig)))
-                requestAndProcess(channel, params, config.standbyConfig, 0, maxRetries)
+                requestAndProcess(
+                    channel, params, config.standbyConfig, 0, maxRetries, lyricIndex, lyricText
+                )
             } else {
                 val next = retries + 1
                 // 2^[next] * 500ms
                 val ms = Math.pow(2.toDouble(), next.coerceAtMost(5).toDouble()) * 500
                 delay(ms.toLong())
-                requestAndProcess(channel, params, config, next, maxRetries)
+                requestAndProcess(channel, params, config, next, maxRetries, lyricIndex, lyricText)
             }
         }
 
@@ -168,6 +182,8 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
         val stream =
             requestInternal(request, playCallback = {
                 logger.debug { "send direct play callback..." }
+                // 直连播放：交给播放器的这一刻就是这一句的开始
+                notifyLyric()
                 channel.send(ChannelPayload.DirectPlayCallback(request, it))
             })
 
@@ -178,7 +194,11 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
             ins = stream,
             request = request,
             targetSampleRate = maxSampleRate,
-            callback = { pcm -> channel.trySendBlocking(ChannelPayload.Bytes(pcm.toByteArray())) }
+            callback = { pcm ->
+                // 第一块音频推给播放器时上报，此时离出声只差一个缓冲
+                notifyLyric()
+                channel.trySendBlocking(ChannelPayload.Bytes(pcm.toByteArray()))
+            }
         ).onFailure { e ->
             event(ErrorEvent.ResultProcessor(request, e))
             return retry()
@@ -197,18 +217,17 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
             produce<ChannelPayload>(CoroutineName("Synthesis producer"), PROCUDE_CAPACITY) {
                 textProcess(params, presetConfigId)
                     .onSuccess { list ->
-                        // 悬浮歌词：先把整段切分结果推给窗口做「上一句／下一句」
+                        // 悬浮歌词：整段切分结果先交给窗口，供「上一句／下一句」
                         LyricBus.onSegments(list.map { it.text })
                         for ((index, segment) in list.withIndex()) {
-                            // 悬浮歌词：开始合成这一句的时候更新当前行
-                            LyricBus.onSegment(index, segment.text)
                             requestAndProcess(
                                 channel,
                                 params.copy(text = segment.text),
-                                segment.tts
+                                segment.tts,
+                                lyricIndex = index,
+                                lyricText = segment.text,
                             )
                         }
-
                     }
                     .onFailure {
                         channel.send(ChannelPayload.Error(it))
