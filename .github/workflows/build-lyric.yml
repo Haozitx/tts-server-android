@@ -1,0 +1,52 @@
+name: Build Lyric Overlay APK
+
+on:
+  push:
+    branches: [ "feat/lyric-overlay" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Generate signing key and local.properties
+        run: |
+          keytool -genkeypair -v \
+            -keystore "$GITHUB_WORKSPACE/app/lyric-key.jks" \
+            -alias lyric \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass lyric123456 -keypass lyric123456 \
+            -dname "CN=Lyric Overlay, OU=DIY, O=Haozitx, L=Beijing, ST=Beijing, C=CN"
+          {
+            echo "KEY_PATH=./lyric-key.jks"
+            echo "KEY_PASSWORD=lyric123456"
+            echo "ALIAS_NAME=lyric"
+            echo "ALIAS_PASSWORD=lyric123456"
+          } > local.properties
+          cat local.properties
+
+      - name: Build lyric flavor APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleLyricDebug --build-cache --parallel --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-server-lyric-debug-apk
+          path: app/build/outputs/apk/lyric/debug/*.apk
+          if-no-files-found: error
