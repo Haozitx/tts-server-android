@@ -27,14 +27,25 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Generate signing key and local.properties
+      # 签名密钥固定下来，不再每次现生成——
+      # 现生成的密钥每跑一次都不一样，系统认为是两个作者，无法覆盖安装。
+      # 优先读仓库 Secrets；没有才退回仓库内的 base64 文件；两者都没有就直接失败。
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.LYRIC_KEYSTORE_B64 }}
         run: |
-          keytool -genkeypair -v \
-            -keystore "$GITHUB_WORKSPACE/app/lyric-key.jks" \
-            -alias lyric \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass lyric123456 -keypass lyric123456 \
-            -dname "CN=Lyric Overlay, OU=DIY, O=Haozitx, L=Beijing, ST=Beijing, C=CN"
+          set -e
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | tr -d '\r\n' | base64 -d > app/lyric-key.jks
+            echo "签名密钥来源：仓库 Secrets（LYRIC_KEYSTORE_B64）"
+          elif [ -f .github/lyric-key.b64 ]; then
+            tr -d '\r\n' < .github/lyric-key.b64 | base64 -d > app/lyric-key.jks
+            echo "签名密钥来源：仓库内 .github/lyric-key.b64（公开可下载）"
+          else
+            echo "::error::找不到固定签名密钥。请在 Settings > Secrets and variables > Actions 新建 LYRIC_KEYSTORE_B64，或把密钥 base64 提交为 .github/lyric-key.b64。"
+            exit 1
+          fi
+          keytool -list -keystore app/lyric-key.jks -storepass lyric123456 | tail -4
           {
             echo "KEY_PATH=./lyric-key.jks"
             echo "KEY_PASSWORD=lyric123456"
@@ -53,6 +64,20 @@ jobs:
           ./gradlew assembleLyricRelease \
             --build-cache --parallel --stacktrace \
             -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m" 2>&1 | tee build.log
+
+      # 把产物实际用的签名指纹打出来，好确认「固定签名」真的生效
+      - name: Verify APK signer
+        if: success()
+        run: |
+          APK=$(ls app/build/outputs/apk/lyric/release/*.apk | head -1)
+          echo "APK: $APK"
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | tail -1)
+          if [ -n "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "$APK" | head -8
+          else
+            echo "未找到 apksigner，改用 keytool 读证书"
+            keytool -printcert -jarfile "$APK" 2>&1 | head -8
+          fi
 
       - name: Upload APK
         if: success()
@@ -86,5 +111,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B ci-logs
           git add -f ci-failure.log
-          git commit -m "ci: release 构建失败日志"
+          git commit -m "ci: 构建失败日志"
           git push -f origin ci-logs
