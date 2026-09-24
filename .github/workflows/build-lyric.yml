@@ -1,3 +1,6 @@
+# 构建触发：固定签名后首次构建（2026-09-25）
+# 签名密钥已固定并暂存于仓库 Secrets：LYRIC_KEYSTORE_B64
+# 预期：本构建产物与上一版签名一致，可直接覆盖升级
 name: Build Lyric Overlay APK
 
 on:
