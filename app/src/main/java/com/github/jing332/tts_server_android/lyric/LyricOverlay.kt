@@ -1,9 +1,14 @@
+
 package com.github.jing332.tts_server_android.lyric
 
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.SystemClock
@@ -16,6 +21,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import com.github.jing332.tts.lyric.LyricBus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +44,10 @@ object LyricOverlay {
     private const val TOUCH_SLOP = 12f
     private const val BASE_SP = 18f
 
+    /** 长句折行：文字最多占屏宽的九成，超了自动换行。 */
+    private const val MAX_WIDTH_RATIO = 0.9f
+    private const val MAX_LINES = 4
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var hideJob: Job? = null
 
@@ -51,7 +61,6 @@ object LyricOverlay {
     private var layoutParams: WindowManager.LayoutParams? = null
 
     private var lastState = LyricBus.LyricState()
-    private var centered = false
 
     private var downRawX = 0f
     private var downRawY = 0f
@@ -60,6 +69,12 @@ object LyricOverlay {
     private var downTime = 0L
     private var dragging = false
 
+    private val screenOffReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            hide()
+        }
+    }
+
     val isShowing: Boolean get() = rootView?.isAttachedToWindow == true
 
     /** 由 LyricInitProvider 在进程启动时调用，开始订阅朗读文本。 */
@@ -67,6 +82,12 @@ object LyricOverlay {
         if (appContext != null) return
         val ctx = context.applicationContext
         appContext = ctx
+        runCatching {
+            ContextCompat.registerReceiver(
+                ctx, screenOffReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+        }
         scope.launch {
             LyricBus.state.collectLatest { state ->
                 lastState = state
@@ -89,6 +110,16 @@ object LyricOverlay {
         render(lastState)
     }
 
+    /** 设置项改完以后立即重画，不用等下一句。 */
+    fun refresh() {
+        val ctx = appContext ?: return
+        if (!LyricPrefs.isEnabled(ctx)) {
+            hide()
+            return
+        }
+        if (lastState.text.isNotBlank()) render(lastState)
+    }
+
     fun hide() {
         hideJob?.cancel()
         hideJob = null
@@ -106,33 +137,88 @@ object LyricOverlay {
     fun canDrawOverlay(context: Context): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)
 
+    private fun isNight(ctx: Context): Boolean =
+        (ctx.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+
+    private fun resolveTextColor(ctx: Context, mode: Int): Int = when (mode) {
+        LyricPrefs.COLOR_WHITE -> Color.WHITE
+        LyricPrefs.COLOR_BLACK -> Color.BLACK
+        else -> if (isNight(ctx)) Color.WHITE else Color.BLACK
+    }
+
+    private fun typefaceOf(family: Int): Typeface = when (family) {
+        LyricPrefs.FONT_SANS -> Typeface.SANS_SERIF
+        LyricPrefs.FONT_SERIF -> Typeface.SERIF
+        LyricPrefs.FONT_MONO -> Typeface.MONOSPACE
+        else -> Typeface.DEFAULT
+    }
+
+    private fun windowFlags(ctx: Context?): Int {
+        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        if (ctx != null && LyricPrefs.isLocked(ctx))
+            flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        return flags
+    }
+
     private fun render(state: LyricBus.LyricState) {
         val ctx = appContext ?: return
         if (!canDrawOverlay(ctx)) return
 
         val scale = LyricPrefs.fontScale(ctx)
-        val threeLine = LyricPrefs.isThreeLine(ctx)
+        val typeface = typefaceOf(LyricPrefs.fontFamily(ctx))
+        val colorMode = LyricPrefs.colorMode(ctx)
+        val textColor = resolveTextColor(ctx, colorMode)
+        val shadowColor = if (textColor == Color.BLACK) Color.WHITE else Color.BLACK
+        val bgAlpha = LyricPrefs.bgAlpha(ctx)
+        val locked = LyricPrefs.isLocked(ctx)
+        val showPrev = LyricPrefs.isShowPrev(ctx)
+        val showNext = LyricPrefs.isShowNext(ctx)
+
         val view = ensureView(ctx)
+        val maxWidth = (ctx.resources.displayMetrics.widthPixels * MAX_WIDTH_RATIO).toInt()
 
         currentView?.apply {
             text = state.text
             setTextSize(TypedValue.COMPLEX_UNIT_SP, BASE_SP * scale)
+            setTextColor(textColor)
+            typeface = typeface
+            setShadowLayer(6f, 0f, 0f, shadowColor)
+            maxWidth = maxWidth
         }
 
-        val sideSp = BASE_SP * scale * 0.72f
+        val sideSp = BASE_SP * scale * 0.7f
         prevView?.apply {
             text = state.previous
             setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
-            visibility = if (threeLine && state.previous.isNotBlank()) View.VISIBLE else View.GONE
+            setTextColor(textColor)
+            typeface = typeface
+            setShadowLayer(6f, 0f, 0f, shadowColor)
+            maxWidth = maxWidth
+            alpha = 0.6f
+            visibility = if (showPrev && state.previous.isNotBlank()) View.VISIBLE else View.GONE
         }
         nextView?.apply {
             text = state.next
             setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
-            visibility = if (threeLine && state.next.isNotBlank()) View.VISIBLE else View.GONE
+            setTextColor(textColor)
+            typeface = typeface
+            setShadowLayer(6f, 0f, 0f, shadowColor)
+            maxWidth = maxWidth
+            alpha = 0.6f
+            visibility = if (showNext && state.next.isNotBlank()) View.VISIBLE else View.GONE
         }
 
-        if (!view.isAttachedToWindow) attach(view)
-        scheduleHide()
+        view.background = if (bgAlpha <= 0) null else GradientDrawable().apply {
+            cornerRadius = 24f * ctx.resources.displayMetrics.density
+            setColor(bgAlpha shl 24)
+        }
+
+        layoutParams?.flags = windowFlags(ctx)
+
+        if (!view.isAttachedToWindow) attach(view) else updateLayout()
+        scheduleHide(locked)
     }
 
     private fun ensureView(ctx: Context): LinearLayout {
@@ -145,10 +231,11 @@ object LyricOverlay {
             setTextColor(Color.WHITE)
             setShadowLayer(6f, 0f, 0f, Color.BLACK)
             gravity = Gravity.CENTER
-            maxLines = 2
-            ellipsize = TextUtils.TruncateAt.END
+            maxLines = MAX_LINES
+            ellipsize = null
             includeFontPadding = false
-            setPadding(dp(4), dp(1), dp(4), dp(1))
+            setLineSpacing(dp(3).toFloat(), 1f)
+            setPadding(dp(6), dp(1), dp(6), dp(1))
         }
 
         val prev = lyricTextView()
@@ -158,10 +245,6 @@ object LyricOverlay {
         val root = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            background = GradientDrawable().apply {
-                cornerRadius = 24f * density
-                setColor(0x7A000000)
-            }
             setPadding(dp(14), dp(7), dp(14), dp(7))
             addView(prev)
             addView(current)
@@ -174,17 +257,21 @@ object LyricOverlay {
         else
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
-        layoutParams = WindowManager.LayoutParams(
+        val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            windowFlags(ctx),
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 0
-            y = (ctx.resources.displayMetrics.heightPixels * 0.72f).toInt()
+            if (LyricPrefs.hasPosition(ctx)) {
+                x = LyricPrefs.posX(ctx)
+                y = LyricPrefs.posY(ctx)
+            } else {
+                x = 0
+                y = (ctx.resources.displayMetrics.heightPixels * 0.72f).toInt()
+            }
         }
 
         windowManager = ctx.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
@@ -193,7 +280,7 @@ object LyricOverlay {
         prevView = prev
         currentView = current
         nextView = next
-        centered = false
+        layoutParams = params
         return root
     }
 
@@ -203,27 +290,32 @@ object LyricOverlay {
         val params = layoutParams ?: return
         runCatching { wm.addView(view, params) }.onFailure { return }
 
-        if (centered) return
+        if (LyricPrefs.hasPosition(ctx)) return
         view.post {
             val p = layoutParams ?: return@post
             val width = ctx.resources.displayMetrics.widthPixels
             p.x = ((width - view.width) / 2).coerceAtLeast(0)
             runCatching { wm.updateViewLayout(view, p) }
-            centered = true
         }
     }
 
-    private fun scheduleHide() {
+    private fun updateLayout() {
+        val view = rootView ?: return
+        val params = layoutParams ?: return
+        runCatching { windowManager?.updateViewLayout(view, params) }
+    }
+
+    private fun scheduleHide(locked: Boolean) {
         hideJob?.cancel()
         hideJob = scope.launch {
             delay(HIDE_DELAY_MS)
-            hide()
+            if (locked || !isLockedNow()) hide()
         }
     }
 
-    private fun toggleThreeLine(ctx: Context) {
-        LyricPrefs.setThreeLine(ctx, !LyricPrefs.isThreeLine(ctx))
-        if (lastState.text.isNotBlank()) render(lastState)
+    private fun isLockedNow(): Boolean {
+        val ctx = appContext ?: return false
+        return LyricPrefs.isLocked(ctx)
     }
 
     private fun openSettings(ctx: Context) {
@@ -236,6 +328,9 @@ object LyricOverlay {
     }
 
     private val touchListener = View.OnTouchListener { view, event ->
+        val ctx = appContext
+        if (ctx != null && LyricPrefs.isLocked(ctx)) return@OnTouchListener false
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downRawX = event.rawX
@@ -261,11 +356,11 @@ object LyricOverlay {
             }
 
             MotionEvent.ACTION_UP -> {
-                if (!dragging) {
-                    if (SystemClock.uptimeMillis() - downTime >= LONG_PRESS_MS)
-                        openSettings(view.context)
-                    else
-                        toggleThreeLine(view.context)
+                if (dragging) {
+                    val params = layoutParams
+                    if (params != null && ctx != null) LyricPrefs.setPosition(ctx, params.x, params.y)
+                } else if (SystemClock.uptimeMillis() - downTime >= LONG_PRESS_MS) {
+                    openSettings(view.context)
                 }
                 dragging = false
                 true

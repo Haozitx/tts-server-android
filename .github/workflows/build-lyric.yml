@@ -5,6 +5,10 @@ on:
     branches: [ "feat/lyric-overlay" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -42,11 +46,34 @@ jobs:
       - name: Build lyric flavor APK
         run: |
           chmod +x gradlew
-          ./gradlew assembleLyricDebug --build-cache --parallel --stacktrace
+          set -o pipefail
+          ./gradlew assembleLyricDebug --build-cache --parallel --stacktrace 2>&1 | tee build.log
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: tts-server-lyric-debug-apk
           path: app/build/outputs/apk/lyric/debug/*.apk
           if-no-files-found: error
+
+      - name: Report failure to issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          grep -nE "^(e: |error:|FAILURE|What went wrong|Caused by:|Execution failed)" build.log > err.txt || true
+          if [ ! -s err.txt ]; then tail -n 150 build.log > err.txt; fi
+          {
+            echo "CI 编译失败，下面是自动摘出的关键行。"
+            echo ""
+            echo '```'
+            head -n 160 err.txt
+            echo '```'
+          } > body.md
+          NUM=$(gh issue list --state open --search "CI in:title" --json number -q '.[0].number' || true)
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --body-file body.md
+          else
+            gh issue create --title "CI 编译错误（自动上报）" --body-file body.md
+          fi
