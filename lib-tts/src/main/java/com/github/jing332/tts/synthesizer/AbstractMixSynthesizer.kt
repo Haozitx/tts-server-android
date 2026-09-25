@@ -184,8 +184,10 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
             request = request,
             targetSampleRate = maxSampleRate,
             callback = { pcm ->
-                onPcmBytes(pcm.size)
-                channel.trySendBlocking(ChannelPayload.Bytes(pcm.toByteArray()))
+                // pcm 是 ByteBuffer，没有 size；先转成字节数组，它的长度就是这一句的音频长度
+                val bytes = pcm.toByteArray()
+                onPcmBytes(bytes.size)
+                channel.trySendBlocking(ChannelPayload.Bytes(bytes))
             }
         ).onFailure { e ->
             event(ErrorEvent.ResultProcessor(request, e))
