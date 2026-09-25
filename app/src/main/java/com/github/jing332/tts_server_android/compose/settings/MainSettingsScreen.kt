@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.HideSource
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.SettingsBackupRestore
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -44,6 +45,7 @@ import com.github.jing332.tts_server_android.compose.systts.directlink.LinkUploa
 import com.github.jing332.tts_server_android.compose.theme.getAppTheme
 import com.github.jing332.tts_server_android.compose.theme.setAppTheme
 import com.github.jing332.tts_server_android.conf.AppConfig
+import com.github.jing332.tts_server_android.lyric.LyricSettingsActivity
 import com.github.jing332.tts_server_android.constant.FilePickerMode
 import com.github.jing332.tts_server_android.utils.MyTools.isIgnoringBatteryOptimizations
 import com.github.jing332.tts_server_android.utils.MyTools.killBattery
@@ -103,6 +105,18 @@ fun SettingsScreen() {
                         ).apply { action = Intent.ACTION_VIEW })
                 },
                 title = { Text(stringResource(id = R.string.backup_restore)) },
+            )
+
+            BasePreferenceWidget(
+                icon = { Icon(Icons.Default.TextFields, null) },
+                onClick = {
+                    context.startActivity(
+                        Intent(
+                            context, LyricSettingsActivity::class.java
+                        ).apply { action = Intent.ACTION_VIEW })
+                },
+                title = { Text("悬浮文本设置") },
+                subTitle = { Text("字号、字体、对齐、停留时长与开关") },
             )
 
             BasePreferenceWidget(
