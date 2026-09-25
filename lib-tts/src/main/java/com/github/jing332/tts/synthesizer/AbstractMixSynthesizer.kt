@@ -142,32 +142,22 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
         config: TtsConfiguration,
         retries: Int = 0,
         maxRetries: Int = context.cfg.maxRetryTimes(),
-        lyricIndex: Int = -1,
-        lyricText: String = "",
+        onPcmBytes: (Int) -> Unit = {},
     ) {
         val request = RequestPayload(params, config)
-
-        // 悬浮歌词：这一句只在音频真的开始输出时报一次。
-        // 合成比播放快得多，按合成时机上报会让歌词比声音超前一整句。
-        var lyricSent = false
-        fun notifyLyric() {
-            if (lyricSent || lyricIndex < 0) return
-            lyricSent = true
-            LyricBus.onSegment(lyricIndex, lyricText)
-        }
 
         suspend fun retry() {
             return if (config.standbyConfig != null && context.cfg.toggleTry() > retries) {
                 event(NormalEvent.StandbyTts(request.copy(config = config.standbyConfig)))
                 requestAndProcess(
-                    channel, params, config.standbyConfig, 0, maxRetries, lyricIndex, lyricText
+                    channel, params, config.standbyConfig, 0, maxRetries, onPcmBytes
                 )
             } else {
                 val next = retries + 1
                 // 2^[next] * 500ms
                 val ms = Math.pow(2.toDouble(), next.coerceAtMost(5).toDouble()) * 500
                 delay(ms.toLong())
-                requestAndProcess(channel, params, config, next, maxRetries, lyricIndex, lyricText)
+                requestAndProcess(channel, params, config, next, maxRetries, onPcmBytes)
             }
         }
 
@@ -182,8 +172,7 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
         val stream =
             requestInternal(request, playCallback = {
                 logger.debug { "send direct play callback..." }
-                // 直连播放：交给播放器的这一刻就是这一句的开始
-                notifyLyric()
+                // 直连播放的音频长度拿不到，交给 producer 用字数估算兜底
                 channel.send(ChannelPayload.DirectPlayCallback(request, it))
             })
 
@@ -195,8 +184,7 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
             request = request,
             targetSampleRate = maxSampleRate,
             callback = { pcm ->
-                // 第一块音频推给播放器时上报，此时离出声只差一个缓冲
-                notifyLyric()
+                onPcmBytes(pcm.size)
                 channel.trySendBlocking(ChannelPayload.Bytes(pcm.toByteArray()))
             }
         ).onFailure { e ->
@@ -217,15 +205,23 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
             produce<ChannelPayload>(CoroutineName("Synthesis producer"), PROCUDE_CAPACITY) {
                 textProcess(params, presetConfigId)
                     .onSuccess { list ->
-                        // 悬浮歌词：整段切分结果先交给窗口，供「上一句／下一句」
-                        LyricBus.onSegments(list.map { it.text })
+                        // 悬浮歌词：整段切分结果先交给窗口，供「上一句／下一句」。
+                        // 朗读规则会把成对引号吃掉，这里按原文位置补回来再显示。
+                        val displays = restoreQuotes(params.text, list.map { it.text })
+                        LyricBus.onSegments(displays)
                         for ((index, segment) in list.withIndex()) {
+                            var pcmBytes = 0
                             requestAndProcess(
                                 channel,
                                 params.copy(text = segment.text),
                                 segment.tts,
-                                lyricIndex = index,
-                                lyricText = segment.text,
+                                onPcmBytes = { pcmBytes += it },
+                            )
+                            // 这一句的音频已经全部产出，字节数就是它的真实长度
+                            LyricBus.onSegment(
+                                index = index,
+                                text = displays.getOrElse(index) { segment.text },
+                                durationMs = pcmToDurationMs(pcmBytes),
                             )
                         }
                     }
@@ -268,6 +264,55 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
         }
 
         Ok(Unit)
+    }
+
+    /** PCM 字节数换算成毫秒（16bit 单声道）。 */
+    private fun pcmToDurationMs(bytes: Int): Long {
+        if (bytes <= 0 || maxSampleRate <= 0) return 0L
+        return bytes.toLong() * 1000L / (maxSampleRate.toLong() * 2L)
+    }
+
+    /**
+     * 悬浮窗显示用的原文还原。
+     * 朗读规则处理对白时会把成对引号切掉（开引号留在旁白段尾、闭引号直接丢弃），
+     * 句子首尾的引号就不见了。这里按切分结果在原文本里的位置把引号补回给对话段，
+     * 只影响显示，送去合成的文本一个字不动。
+     */
+    private fun restoreQuotes(original: String, segments: List<String>): List<String> {
+        if (original.isBlank() || segments.isEmpty()) return segments
+        val opens = "\u201c\u2018\u300c\u300e"
+        val closes = "\u201d\u2019\u300d\u300f"
+        val out = ArrayList<String>(segments.size)
+        var cursor = 0
+        for (s in segments) {
+            val at = original.indexOf(s, cursor)
+            if (at < 0) {
+                out.add(s)
+                continue
+            }
+            var start = at
+            var end = at + s.length
+            cursor = end
+            // 引号对横跨段边界时（旁白吞了开引号、对话段闭引号被丢），两侧一起划给对话段
+            if (start > 0 && end < original.length &&
+                opens.indexOf(original[start - 1]) >= 0 && closes.indexOf(original[end]) >= 0
+            ) {
+                start -= 1
+                end += 1
+            }
+            out.add(original.substring(start, end))
+        }
+        // 旁白段尾那个开引号已经归对话段了，这里去掉重复
+        for (i in 0 until out.size - 1) {
+            val cur = out[i]
+            val nxt = out[i + 1]
+            if (cur.isNotEmpty() && nxt.isNotEmpty() && cur.last() == nxt[0] &&
+                opens.indexOf(nxt[0]) >= 0
+            ) {
+                out[i] = cur.dropLast(1)
+            }
+        }
+        return out
     }
 
     private val mutex = Mutex()
