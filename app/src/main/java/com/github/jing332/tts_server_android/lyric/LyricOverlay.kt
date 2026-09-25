@@ -26,7 +26,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
@@ -36,25 +35,26 @@ import kotlin.math.abs
  * 用系统窗口（WindowManager + TYPE_APPLICATION_OVERLAY）实现，不额外依赖第三方悬浮窗库、
  * 不额外起常驻服务：App 进程活着的时候随朗读数据出现，停读后自动移除。
  *
- * 三个约定：
- *  1. 切换由总线推送驱动——合成器在音频开始输出时才上报，所以歌词不会比声音超前。
- *  2. 每一句按它会念多久来定最少停留时间，读完之前不会消失。
- *  3. 只能上下拖；左右固定为「居左 / 居中 / 居右」三档。
+ * 三条约定：
+ *  1. 什么时候换句由「这一句的音频长度」决定，不由数据到达决定——
+ *     合成和写播放器缓冲都比实际播放快，按到达切必然抢拍。
+ *  2. 每一句按自己的音频长度停留，读完之前不会消失。
+ *  3. 条占满屏宽（这样一行能放下更多字），只能上下拖；左右由档位决定文字怎么排。
  */
 object LyricOverlay {
-    /** 时长未知时的兜底停留时间。 */
+    /** 拿不到时长时的兜底停留时间。 */
     private const val HIDE_DELAY_MS = 8_000L
 
-    /** 按估算时长停留之外，再宽限一会儿。 */
-    private const val HIDE_EXTRA_MS = 1_500L
+    /** 按音频长度停留之外再宽限一会儿，免得最后一个字被切掉。 */
+    private const val HIDE_EXTRA_MS = 1_200L
 
     private const val LONG_PRESS_MS = 500L
     private const val TOUCH_SLOP = 12f
     private const val BASE_SP = 18f
-
-    /** 文字最多占屏宽的比例（剩下的是边距，和横向对齐一起决定行数）。 */
-    private const val MAX_WIDTH_RATIO = 0.94f
     private const val MAX_LINES = 4
+
+    /** 条左右各留一点，免得字贴到屏幕边。 */
+    private const val SIDE_PADDING_DP = 14
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var hideJob: Job? = null
@@ -68,7 +68,9 @@ object LyricOverlay {
     private var nextView: TextView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
 
-    private var lastState = LyricBus.LyricState()
+    /** 时间轴：这一轮朗读从哪个时刻起算，以及已经往下排了多少毫秒。 */
+    private var timelineBase = 0L
+    private var timelineCursor = 0L
 
     private var downRawY = 0f
     private var downY = 0
@@ -83,7 +85,7 @@ object LyricOverlay {
 
     val isShowing: Boolean get() = rootView?.isAttachedToWindow == true
 
-    /** 由 LyricInitProvider 在进程启动时调用，开始订阅朗读文本。 */
+    /** 由 LyricInitProvider 在进程启动时调用，开始订阅朗读数据。 */
     fun init(context: Context) {
         if (appContext != null) return
         val ctx = context.applicationContext
@@ -95,26 +97,40 @@ object LyricOverlay {
             )
         }
         scope.launch {
-            LyricBus.state.collectLatest { state ->
-                lastState = state
-                if (state.text.isBlank()) return@collectLatest
-                if (!LyricPrefs.isEnabled(ctx)) return@collectLatest
-                render(state)
+            for (seg in LyricBus.segments) {
+                if (!LyricPrefs.isEnabled(ctx)) continue
+                // 已经换了一轮朗读，之前积压的句子丢掉
+                if (seg.generation != LyricBus.currentGeneration()) continue
+                showOnTimeline(seg)
             }
         }
     }
 
-    /** 设置页的「测试显示」用，绕过总线直接渲染一句。 */
+    /**
+     * 按音频长度排队显示。
+     *
+     * 每一句什么时候出现，由前面几句音频长度的累加值决定，而不是「数据到了就切」。
+     * 数据比声音跑得快得多，只有按时长排队才跟得上播放。
+     */
+    private suspend fun showOnTimeline(seg: LyricBus.Segment) {
+        val now = SystemClock.uptimeMillis()
+        if (seg.index <= 0 || timelineBase == 0L) {
+            timelineBase = now
+            timelineCursor = 0L
+        }
+        val wait = timelineBase + timelineCursor - now
+        if (wait > 0) delay(wait)
+        timelineCursor += seg.durationMs
+        render(seg.index, seg.text, seg.durationMs)
+    }
+
+    /** 设置页的「测试显示」用，不走总线直接渲染一句。 */
     fun preview(context: Context, text: String) {
         init(context)
-        lastState = LyricBus.LyricState(
-            segments = listOf(text),
-            index = 0,
-            text = text,
-            updatedAt = System.currentTimeMillis(),
-            durationMs = LyricBus.estimateDurationMs(text),
-        )
-        render(lastState)
+        val dur = LyricBus.estimateDurationMs(text)
+        timelineBase = SystemClock.uptimeMillis()
+        timelineCursor = dur
+        render(0, text, dur)
     }
 
     /** 设置项改完以后立即重画，不用等下一句。 */
@@ -124,7 +140,8 @@ object LyricOverlay {
             hide()
             return
         }
-        if (lastState.text.isNotBlank()) render(lastState)
+        val st = LyricBus.state.value
+        if (st.text.isNotBlank()) render(st.index, st.text, st.durationMs)
     }
 
     fun hide() {
@@ -139,6 +156,8 @@ object LyricOverlay {
         currentView = null
         nextView = null
         layoutParams = null
+        timelineBase = 0L
+        timelineCursor = 0L
     }
 
     fun canDrawOverlay(context: Context): Boolean =
@@ -169,7 +188,14 @@ object LyricOverlay {
         return flags
     }
 
-    private fun render(state: LyricBus.LyricState) {
+    /** 文字在条内的水平排布：居左／居中／居右。 */
+    private fun textGravity(align: Int): Int = when (align) {
+        LyricPrefs.ALIGN_LEFT -> Gravity.START or Gravity.CENTER_VERTICAL
+        LyricPrefs.ALIGN_RIGHT -> Gravity.END or Gravity.CENTER_VERTICAL
+        else -> Gravity.CENTER
+    }
+
+    private fun render(index: Int, text: String, durationMs: Long) {
         val ctx = appContext ?: return
         if (!canDrawOverlay(ctx)) return
 
@@ -177,64 +203,69 @@ object LyricOverlay {
         val tf = typefaceOf(LyricPrefs.fontFamily(ctx))
         val colorMode = LyricPrefs.colorMode(ctx)
         val textColor = resolveTextColor(ctx, colorMode)
-        val shadowColor = if (textColor == Color.BLACK) Color.WHITE else Color.BLACK
+        // 投影一律用黑色：白字靠它压住浅色背景，黑字配黑边就等于没有白边（浅色模式下发白边会发虚）
+        val shadowColor = Color.BLACK
         val bgAlpha = LyricPrefs.bgAlpha(ctx)
         val locked = LyricPrefs.isLocked(ctx)
         val showPrev = LyricPrefs.isShowPrev(ctx)
         val showNext = LyricPrefs.isShowNext(ctx)
+        val align = LyricPrefs.align(ctx)
 
         val view = ensureView(ctx)
-        val maxW = (ctx.resources.displayMetrics.widthPixels * MAX_WIDTH_RATIO).toInt()
+        val st = LyricBus.state.value
+        val prevText = st.segments.getOrNull(index - 1).orEmpty()
+        val nextText = st.segments.getOrNull(index + 1).orEmpty()
+
+        val density = ctx.resources.displayMetrics.density
+        val screenWidth = ctx.resources.displayMetrics.widthPixels
+        val maxW = screenWidth - (SIDE_PADDING_DP * 2 * density).toInt()
         val mainSp = BASE_SP * scale
         val sideSp = mainSp * 0.7f
 
         currentView?.let { tv ->
-            tv.text = state.text
+            tv.text = text
             tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, mainSp)
             tv.setTextColor(textColor)
             tv.typeface = tf
             tv.setShadowLayer(6f, 0f, 0f, shadowColor)
             tv.maxWidth = maxW
+            tv.gravity = textGravity(align)
             tv.visibility = View.VISIBLE
         }
 
         prevView?.let { tv ->
-            tv.text = state.previous
+            tv.text = prevText
             tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
             tv.setTextColor(textColor)
             tv.typeface = tf
             tv.setShadowLayer(6f, 0f, 0f, shadowColor)
             tv.maxWidth = maxW
+            tv.gravity = textGravity(align)
             tv.alpha = 0.6f
-            tv.visibility = if (showPrev && state.previous.isNotBlank()) View.VISIBLE else View.GONE
+            tv.visibility = if (showPrev && prevText.isNotBlank()) View.VISIBLE else View.GONE
         }
 
         nextView?.let { tv ->
-            tv.text = state.next
+            tv.text = nextText
             tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sideSp)
             tv.setTextColor(textColor)
             tv.typeface = tf
             tv.setShadowLayer(6f, 0f, 0f, shadowColor)
             tv.maxWidth = maxW
+            tv.gravity = textGravity(align)
             tv.alpha = 0.6f
-            tv.visibility = if (showNext && state.next.isNotBlank()) View.VISIBLE else View.GONE
+            tv.visibility = if (showNext && nextText.isNotBlank()) View.VISIBLE else View.GONE
         }
 
         view.background = if (bgAlpha <= 0) null else GradientDrawable().apply {
-            cornerRadius = 24f * ctx.resources.displayMetrics.density
+            cornerRadius = 24f * density
             setColor(bgAlpha shl 24)
         }
 
         layoutParams?.flags = windowFlags(ctx)
 
-        if (!view.isAttachedToWindow) {
-            attach(view)
-        } else {
-            updateLayout()
-            // 文字换了，宽高跟着变，重新按对齐算一次横坐标
-            view.post { applyAlign() }
-        }
-        scheduleHide(state.durationMs, locked)
+        if (!view.isAttachedToWindow) attach(view) else updateLayout()
+        scheduleHide(durationMs, locked)
     }
 
     private fun ensureView(ctx: Context): LinearLayout {
@@ -261,7 +292,7 @@ object LyricOverlay {
         val root = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setPadding(dp(14), dp(7), dp(14), dp(7))
+            setPadding(dp(SIDE_PADDING_DP), dp(7), dp(SIDE_PADDING_DP), dp(7))
             addView(prev)
             addView(current)
             addView(next)
@@ -274,14 +305,14 @@ object LyricOverlay {
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+            // 顶格：宽度固定成整屏，不再由文字长短决定——文字短的时候条会缩得很窄，行数就多
+            ctx.resources.displayMetrics.widthPixels,
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
             windowFlags(ctx),
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            // 横坐标交给 applyAlign 算，这里只给一个初值
             x = 0
             y = if (LyricPrefs.hasPosY(ctx)) LyricPrefs.posY(ctx)
             else (ctx.resources.displayMetrics.heightPixels * 0.72f).toInt()
@@ -300,29 +331,12 @@ object LyricOverlay {
     private fun attach(view: LinearLayout) {
         val wm = windowManager ?: return
         val params = layoutParams ?: return
-        runCatching { wm.addView(view, params) }.onFailure { return }
-        // 宽高要等布局完成才知道，所以下一帧再对齐
-        view.post { applyAlign() }
+        runCatching { wm.addView(view, params) }
     }
 
     private fun updateLayout() {
         val view = rootView ?: return
         val params = layoutParams ?: return
-        runCatching { windowManager?.updateViewLayout(view, params) }
-    }
-
-    /** 按「居左／居中／居右」档位算横坐标；纵坐标不动。 */
-    private fun applyAlign() {
-        val ctx = appContext ?: return
-        val view = rootView ?: return
-        val params = layoutParams ?: return
-        if (view.width <= 0) return
-        val screenWidth = ctx.resources.displayMetrics.widthPixels
-        params.x = when (LyricPrefs.align(ctx)) {
-            LyricPrefs.ALIGN_LEFT -> 0
-            LyricPrefs.ALIGN_RIGHT -> (screenWidth - view.width).coerceAtLeast(0)
-            else -> ((screenWidth - view.width) / 2).coerceAtLeast(0)
-        }
         runCatching { windowManager?.updateViewLayout(view, params) }
     }
 
