@@ -8,11 +8,11 @@ import kotlinx.coroutines.flow.StateFlow
 /**
  * 朗读文本总线。
  *
- * 合成管线把每一句的显示文本、以及这一句在音频里的真实长度推到这里，悬浮条订阅它。
- * 放在 lib-tts 里，任何走合成器的入口（系统 TTS、HTTP 服务、转发器）都能被覆盖。
+ * 合成管线把每一句的显示文本、这一句在音频里的真实长度、以及这一句所在的那一段全文推到这里，
+ * 悬浮条订阅它。放在 lib-tts 里，任何走合成器的入口（系统 TTS、HTTP 服务、转发器）都能被覆盖。
  *
- * 为什么一定要带长度：合成和「写进播放器缓冲」都比实际播放快得多，一次能灌进好几句，
- * 所以「下一句到了就切换」必然抢拍。改成按音频长度排队推进，显示节奏才和播放同源。
+ * 这一版的关键改动：新一段开始时**不再清空**已经排队的句子。
+ * 之前那样做会把还没显示出去的几句丢掉，表现就是「读出来了但一个字都没显示」。
  */
 object LyricBus {
 
@@ -29,39 +29,38 @@ object LyricBus {
         val next: String get() = segments.getOrNull(index + 1).orEmpty()
     }
 
-    /** 一句朗读：显示文本 + 这一句在音频里的真实长度。 */
+    /**
+     * 一句朗读。
+     *
+     * [list] 是这一句所在那一段的全文，窗口拿它直接取上一句／下一句——
+     * 这样下一句在还没合成出来的时候就能显示，不受 TTS 快慢影响。
+     */
     data class Segment(
-        val generation: Long,
         val index: Int,
         val text: String,
         val durationMs: Long,
+        val list: List<String> = emptyList(),
+        val updatedAt: Long = 0L,
     )
 
     private val _state = MutableStateFlow(LyricState())
 
     val state: StateFlow<LyricState> get() = _state
 
-    private var generation = 0L
-
     private val _segments = Channel<Segment>(Channel.UNLIMITED)
 
-    /** 逐句事件流。用队列而不是状态，避免连续多句到达时被覆盖掉。 */
+    /** 逐句事件流。队列无上限，只进不丢。 */
     val segments: ReceiveChannel<Segment> get() = _segments
 
-    fun currentGeneration(): Long = generation
+    /** 当前这一段（一次合成请求）切分出来的全部句子。 */
+    private var currentList: List<String> = emptyList()
 
-    /**
-     * 一段新文本被切分出来：更新列表供「上一句／下一句」用，并重开这一轮时间轴。
-     * 上一段没来得及显示的句子一并丢掉，免得串到新的一段里。
-     */
+    /** 一段文本被切分出来：列表换新，已经排队的句子不动。 */
     fun onSegments(displays: List<String>) {
         val list = displays.map { it.trim() }.filter { it.isNotEmpty() }
         if (list.isEmpty()) return
-        generation++
+        currentList = list
         _state.value = LyricState(segments = list, index = -1)
-        while (_segments.tryReceive().isSuccess) {
-            // 丢掉旧段落积压的事件
-        }
     }
 
     /**
@@ -79,7 +78,15 @@ object LyricBus {
             updatedAt = System.currentTimeMillis(),
             durationMs = dur,
         )
-        _segments.trySend(Segment(generation, index, t, dur))
+        _segments.trySend(
+            Segment(
+                index = index,
+                text = t,
+                durationMs = dur,
+                list = currentList,
+                updatedAt = System.currentTimeMillis(),
+            )
+        )
     }
 
     /** 结束当前朗读（清空正在念的一句，窗口自己超时隐藏）。 */

@@ -35,29 +35,40 @@ import kotlin.math.abs
  * 用系统窗口（WindowManager + TYPE_APPLICATION_OVERLAY）实现，不额外依赖第三方悬浮窗库、
  * 不额外起常驻服务：App 进程活着的时候随朗读数据出现，停读后自动移除。
  *
- * 三条约定：
- *  1. 什么时候换句由「这一句的音频长度」决定，不由数据到达决定——
- *     合成和写播放器缓冲都比实际播放快，按到达切必然抢拍。
- *  2. 每一句按自己的音频长度停留，读完之前不会消失。
- *  3. 条占满屏宽（这样一行能放下更多字），只能上下拖；左右由档位决定文字怎么排。
+ * 这一版改了两处驱动方式：
+ *  1. 画面推进由「上一句读满它自己的时长」这个时间点驱动，不看下一句的数据到没到齐。
+ *     上一句因此不会被下一句拖住，上一句／下一句都从句子列表里直接取，不查全局状态。
+ *  2. 数据只往队尾排，不清仓。之前新一段开始时把积压的句子丢掉，那几句就有声没字。
  */
 object LyricOverlay {
+    /** 一句读完之后的宽限时间，用来吸收合成与播放之间的抖动。 */
+    private const val HIDE_EXTRA_MS = 2_000L
+
     /** 拿不到时长时的兜底停留时间。 */
     private const val HIDE_DELAY_MS = 8_000L
-
-    /** 按音频长度停留之外再宽限一会儿，免得最后一个字被切掉。 */
-    private const val HIDE_EXTRA_MS = 1_200L
 
     private const val LONG_PRESS_MS = 500L
     private const val TOUCH_SLOP = 12f
     private const val BASE_SP = 18f
     private const val MAX_LINES = 4
-
-    /** 条左右各留一点，免得字贴到屏幕边。 */
     private const val SIDE_PADDING_DP = 14
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var hideJob: Job? = null
+    private var advanceJob: Job? = null
+
+    /** 待显示的句子，先进先出。 */
+    private val queue = ArrayDeque<LyricBus.Segment>()
+
+    private var prevText = ""
+    private var curText = ""
+    private var nextText = ""
+
+    /** 上一次显示出去的正文。新一段的第一句没有上一句时，拿它接上。 */
+    private var lastShown = ""
+
+    private var shownDuration = 0L
+    private var shownSeg: LyricBus.Segment? = null
 
     private var appContext: Context? = null
     private var windowManager: WindowManager? = null
@@ -67,10 +78,6 @@ object LyricOverlay {
     private var currentView: TextView? = null
     private var nextView: TextView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
-
-    /** 时间轴：这一轮朗读从哪个时刻起算，以及已经往下排了多少毫秒。 */
-    private var timelineBase = 0L
-    private var timelineCursor = 0L
 
     private var downRawY = 0f
     private var downY = 0
@@ -99,38 +106,50 @@ object LyricOverlay {
         scope.launch {
             for (seg in LyricBus.segments) {
                 if (!LyricPrefs.isEnabled(ctx)) continue
-                // 已经换了一轮朗读，之前积压的句子丢掉
-                if (seg.generation != LyricBus.currentGeneration()) continue
-                showOnTimeline(seg)
+                queue.addLast(seg)
+                if (advanceJob?.isActive != true) advanceJob = scope.launch { runTimeline() }
             }
         }
     }
 
     /**
-     * 按音频长度排队显示。
-     *
-     * 每一句什么时候出现，由前面几句音频长度的累加值决定，而不是「数据到了就切」。
-     * 数据比声音跑得快得多，只有按时长排队才跟得上播放。
+     * 一句一句往外推。
+     * 队列空了就退出，画面停在最后一句上，等下一批数据到了再起来——期间不清空、不隐藏。
      */
-    private suspend fun showOnTimeline(seg: LyricBus.Segment) {
-        val now = SystemClock.uptimeMillis()
-        if (seg.index <= 0 || timelineBase == 0L) {
-            timelineBase = now
-            timelineCursor = 0L
+    private suspend fun runTimeline() {
+        while (true) {
+            val seg = queue.firstOrNull() ?: break
+            queue.removeFirst()
+            show(seg)
+            delay(seg.durationMs)
         }
-        val wait = timelineBase + timelineCursor - now
-        if (wait > 0) delay(wait)
-        timelineCursor += seg.durationMs
-        render(seg.index, seg.text, seg.durationMs)
+    }
+
+    private fun show(seg: LyricBus.Segment) {
+        val list = seg.list
+        val hasPrev = seg.index > 0 && seg.index - 1 < list.size
+        val hasNext = seg.index + 1 < list.size
+        prevText = if (hasPrev) list[seg.index - 1] else lastShown
+        nextText = if (hasNext) list[seg.index + 1] else ""
+        curText = seg.text
+        shownDuration = seg.durationMs
+        shownSeg = seg
+        lastShown = seg.text
+        paint()
+        scheduleHide()
     }
 
     /** 设置页的「测试显示」用，不走总线直接渲染一句。 */
     fun preview(context: Context, text: String) {
         init(context)
-        val dur = LyricBus.estimateDurationMs(text)
-        timelineBase = SystemClock.uptimeMillis()
-        timelineCursor = dur
-        render(0, text, dur)
+        prevText = ""
+        nextText = ""
+        curText = text
+        shownDuration = LyricBus.estimateDurationMs(text)
+        shownSeg = null
+        lastShown = text
+        paint()
+        scheduleHide()
     }
 
     /** 设置项改完以后立即重画，不用等下一句。 */
@@ -140,24 +159,32 @@ object LyricOverlay {
             hide()
             return
         }
-        val st = LyricBus.state.value
-        if (st.text.isNotBlank()) render(st.index, st.text, st.durationMs)
+        if (curText.isNotBlank()) paint()
     }
 
     fun hide() {
         hideJob?.cancel()
         hideJob = null
-        val view = rootView ?: return
-        runCatching {
-            if (view.isAttachedToWindow) windowManager?.removeView(view)
+        advanceJob?.cancel()
+        advanceJob = null
+        queue.clear()
+        val view = rootView
+        if (view != null) {
+            runCatching {
+                if (view.isAttachedToWindow) windowManager?.removeView(view)
+            }
         }
         rootView = null
         prevView = null
         currentView = null
         nextView = null
         layoutParams = null
-        timelineBase = 0L
-        timelineCursor = 0L
+        shownSeg = null
+        curText = ""
+        prevText = ""
+        nextText = ""
+        lastShown = ""
+        shownDuration = 0L
     }
 
     fun canDrawOverlay(context: Context): Boolean =
@@ -195,27 +222,21 @@ object LyricOverlay {
         else -> Gravity.CENTER
     }
 
-    private fun render(index: Int, text: String, durationMs: Long) {
+    private fun paint() {
         val ctx = appContext ?: return
         if (!canDrawOverlay(ctx)) return
 
         val scale = LyricPrefs.fontScale(ctx)
         val tf = typefaceOf(LyricPrefs.fontFamily(ctx))
-        val colorMode = LyricPrefs.colorMode(ctx)
-        val textColor = resolveTextColor(ctx, colorMode)
-        // 投影一律用黑色：白字靠它压住浅色背景，黑字配黑边就等于没有白边（浅色模式下发白边会发虚）
+        val textColor = resolveTextColor(ctx, LyricPrefs.colorMode(ctx))
+        // 投影一律用黑色。黑字配黑边等于没有白边——浅色模式下发虚的白边正是之前看不清的原因
         val shadowColor = Color.BLACK
         val bgAlpha = LyricPrefs.bgAlpha(ctx)
-        val locked = LyricPrefs.isLocked(ctx)
         val showPrev = LyricPrefs.isShowPrev(ctx)
         val showNext = LyricPrefs.isShowNext(ctx)
         val align = LyricPrefs.align(ctx)
 
         val view = ensureView(ctx)
-        val st = LyricBus.state.value
-        val prevText = st.segments.getOrNull(index - 1).orEmpty()
-        val nextText = st.segments.getOrNull(index + 1).orEmpty()
-
         val density = ctx.resources.displayMetrics.density
         val screenWidth = ctx.resources.displayMetrics.widthPixels
         val maxW = screenWidth - (SIDE_PADDING_DP * 2 * density).toInt()
@@ -223,7 +244,7 @@ object LyricOverlay {
         val sideSp = mainSp * 0.7f
 
         currentView?.let { tv ->
-            tv.text = text
+            tv.text = curText
             tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, mainSp)
             tv.setTextColor(textColor)
             tv.typeface = tf
@@ -265,7 +286,6 @@ object LyricOverlay {
         layoutParams?.flags = windowFlags(ctx)
 
         if (!view.isAttachedToWindow) attach(view) else updateLayout()
-        scheduleHide(durationMs, locked)
     }
 
     private fun ensureView(ctx: Context): LinearLayout {
@@ -305,7 +325,7 @@ object LyricOverlay {
             @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         val params = WindowManager.LayoutParams(
-            // 顶格：宽度固定成整屏，不再由文字长短决定——文字短的时候条会缩得很窄，行数就多
+            // 顶格：宽度固定成整屏，不再由文字长短决定
             ctx.resources.displayMetrics.widthPixels,
             WindowManager.LayoutParams.WRAP_CONTENT,
             windowType,
@@ -340,15 +360,17 @@ object LyricOverlay {
         runCatching { windowManager?.updateViewLayout(view, params) }
     }
 
-    private fun scheduleHide(durationMs: Long, locked: Boolean) {
+    private fun scheduleHide() {
         hideJob?.cancel()
         hideJob = null
+        val ctx = appContext ?: return
         // 钉住的时候不自动隐藏，想看多久就看多久
-        if (locked) return
-        val hold = if (durationMs > 0L) durationMs + HIDE_EXTRA_MS else HIDE_DELAY_MS
+        if (LyricPrefs.isLocked(ctx)) return
+        val hold = if (shownDuration > 0L) shownDuration + HIDE_EXTRA_MS else HIDE_DELAY_MS
         hideJob = scope.launch {
             delay(hold)
-            if (!isLockedNow()) hide()
+            // 后面还有排队的句子就不隐藏，免得中间闪一下
+            if (queue.isEmpty() && !isLockedNow()) hide()
         }
     }
 
