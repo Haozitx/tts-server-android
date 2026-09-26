@@ -211,20 +211,32 @@ abstract class AbstractMixSynthesizer() : Synthesizer {
                         // 朗读规则会把成对引号吃掉，这里按原文位置补回来再显示。
                         val displays = restoreQuotes(params.text, list.map { it.text })
                         LyricBus.onSegments(displays)
+
+                        // 前面已经播完的音频总长。第 n 句的显示时刻就是它决定的。
+                        var offsetMs = 0L
                         for ((index, segment) in list.withIndex()) {
                             var pcmBytes = 0
+                            var announced = false
+                            val display = displays.getOrElse(index) { segment.text }
                             requestAndProcess(
                                 channel,
                                 params.copy(text = segment.text),
                                 segment.tts,
-                                onPcmBytes = { pcmBytes += it },
+                                onPcmBytes = { n ->
+                                    if (!announced) {
+                                        announced = true
+                                        // 音频的第一个字节产出，声音就从这一刻开始。
+                                        // 等整句合成完才上报会晚一个合成耗时，句子越长晚得越多。
+                                        LyricBus.onSegment(index, display, 0L, offsetMs)
+                                    }
+                                    pcmBytes += n
+                                },
                             )
-                            // 这一句的音频已经全部产出，字节数就是它的真实长度
-                            LyricBus.onSegment(
-                                index = index,
-                                text = displays.getOrElse(index) { segment.text },
-                                durationMs = pcmToDurationMs(pcmBytes),
-                            )
+                            if (!announced) {
+                                // 这一句没有音频（静音、失败、直连播放）也要让它上线，免得文本断档
+                                LyricBus.onSegment(index, display, 0L, offsetMs)
+                            }
+                            offsetMs += pcmToDurationMs(pcmBytes)
                         }
                     }
                     .onFailure {

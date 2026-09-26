@@ -8,11 +8,12 @@ import kotlinx.coroutines.flow.StateFlow
 /**
  * 朗读文本总线。
  *
- * 合成管线把每一句的显示文本、这一句在音频里的真实长度、以及这一句所在的那一段全文推到这里，
- * 悬浮条订阅它。放在 lib-tts 里，任何走合成器的入口（系统 TTS、HTTP 服务、转发器）都能被覆盖。
+ * 合成管线把每一句的显示文本、这一句在音频里的真实长度、这一句前面已播完的音频总长、
+ * 以及这一句所在那一段的全文推到这里，悬浮条订阅它。
+ * 放在 lib-tts 里，任何走合成器的入口（系统 TTS、HTTP 服务、转发器）都能被覆盖。
  *
- * 这一版的关键改动：新一段开始时**不再清空**已经排队的句子。
- * 之前那样做会把还没显示出去的几句丢掉，表现就是「读出来了但一个字都没显示」。
+ * [Segment.offsetMs] 是这一版的关键：它把「这一句该什么时候显示」变成与声音同源的时间，
+ * 而不是「数据什么时候到就什么时候显示」。
  */
 object LyricBus {
 
@@ -32,13 +33,14 @@ object LyricBus {
     /**
      * 一句朗读。
      *
-     * [list] 是这一句所在那一段的全文，窗口拿它直接取上一句／下一句——
-     * 这样下一句在还没合成出来的时候就能显示，不受 TTS 快慢影响。
+     * @param offsetMs 这一句之前已经播完的音频总长。显示时刻 = 本段第一句的起点 + offsetMs。
+     * @param list 这一句所在那一段的全文，窗口拿它直接取上一句／下一句。
      */
     data class Segment(
         val index: Int,
         val text: String,
         val durationMs: Long,
+        val offsetMs: Long = 0L,
         val list: List<String> = emptyList(),
         val updatedAt: Long = 0L,
     )
@@ -64,11 +66,16 @@ object LyricBus {
     }
 
     /**
-     * 第 index 句的音频已经全部产出。
+     * 第 index 句的音频开始产出（第一个字节）时调用。
      *
-     * @param durationMs 这一句音频的真实长度；拿不到（直连播放等）就按字数估。
+     * @param durationMs 这一句音频长度；第一字节时还不知道就传 0，按字数估。
      */
-    fun onSegment(index: Int, text: String, durationMs: Long = 0L) {
+    fun onSegment(
+        index: Int,
+        text: String,
+        durationMs: Long = 0L,
+        offsetMs: Long = 0L,
+    ) {
         val t = text.trim()
         if (t.isEmpty()) return
         val dur = if (durationMs > 0L) durationMs else estimateDurationMs(t)
@@ -83,6 +90,7 @@ object LyricBus {
                 index = index,
                 text = t,
                 durationMs = dur,
+                offsetMs = offsetMs,
                 list = currentList,
                 updatedAt = System.currentTimeMillis(),
             )

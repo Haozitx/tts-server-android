@@ -35,10 +35,10 @@ import kotlin.math.abs
  * 用系统窗口（WindowManager + TYPE_APPLICATION_OVERLAY）实现，不额外依赖第三方悬浮窗库、
  * 不额外起常驻服务：App 进程活着的时候随朗读数据出现，停读后自动移除。
  *
- * 这一版改了两处驱动方式：
- *  1. 画面推进由「上一句读满它自己的时长」这个时间点驱动，不看下一句的数据到没到齐。
- *     上一句因此不会被下一句拖住，上一句／下一句都从句子列表里直接取，不查全局状态。
- *  2. 数据只往队尾排，不清仓。之前新一段开始时把积压的句子丢掉，那几句就有声没字。
+ * 画面推进由时间表决定：
+ *  - 每一句带 [LyricBus.Segment.offsetMs]（它之前已经播完的音频总长）。
+ *  - 一段朗读的第一句到达时定下基准时刻，这一句立即显示——它也是声音开始的那一刻。
+ *  - 后面的句子等到「基准 + offsetMs」再显示，因此文本与声音同源，不受 TTS 快慢影响。
  */
 object LyricOverlay {
     /** 一句读完之后的宽限时间，用来吸收合成与播放之间的抖动。 */
@@ -60,6 +60,9 @@ object LyricOverlay {
     /** 待显示的句子，先进先出。 */
     private val queue = ArrayDeque<LyricBus.Segment>()
 
+    /** 这一段朗读的基准时刻（第一句到达的那一刻＝声音起点）。 */
+    private var timelineBase = 0L
+
     private var prevText = ""
     private var curText = ""
     private var nextText = ""
@@ -68,7 +71,6 @@ object LyricOverlay {
     private var lastShown = ""
 
     private var shownDuration = 0L
-    private var shownSeg: LyricBus.Segment? = null
 
     private var appContext: Context? = null
     private var windowManager: WindowManager? = null
@@ -113,15 +115,19 @@ object LyricOverlay {
     }
 
     /**
-     * 一句一句往外推。
+     * 按时间表往下推。
      * 队列空了就退出，画面停在最后一句上，等下一批数据到了再起来——期间不清空、不隐藏。
      */
     private suspend fun runTimeline() {
         while (true) {
             val seg = queue.firstOrNull() ?: break
             queue.removeFirst()
+            val now = SystemClock.uptimeMillis()
+            // 一段朗读的第一句到达时定基准，它也是声音开始的那一刻
+            if (seg.index <= 0 || timelineBase == 0L) timelineBase = now
+            val wait = timelineBase + seg.offsetMs - now
+            if (wait > 0) delay(wait)
             show(seg)
-            delay(seg.durationMs)
         }
     }
 
@@ -133,7 +139,6 @@ object LyricOverlay {
         nextText = if (hasNext) list[seg.index + 1] else ""
         curText = seg.text
         shownDuration = seg.durationMs
-        shownSeg = seg
         lastShown = seg.text
         paint()
         scheduleHide()
@@ -146,8 +151,8 @@ object LyricOverlay {
         nextText = ""
         curText = text
         shownDuration = LyricBus.estimateDurationMs(text)
-        shownSeg = null
         lastShown = text
+        timelineBase = SystemClock.uptimeMillis()
         paint()
         scheduleHide()
     }
@@ -179,12 +184,12 @@ object LyricOverlay {
         currentView = null
         nextView = null
         layoutParams = null
-        shownSeg = null
         curText = ""
         prevText = ""
         nextText = ""
         lastShown = ""
         shownDuration = 0L
+        timelineBase = 0L
     }
 
     fun canDrawOverlay(context: Context): Boolean =
